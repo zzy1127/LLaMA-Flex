@@ -88,7 +88,6 @@ class DynamicSelector:
             collate_fn=self.data_collator,
         )
         dataloader = self.accelerator.prepare(dataloader)
-        device = self.accelerator.device
 
         # 2) 各卡跑前向，收集 loss
         local_losses = []
@@ -98,13 +97,13 @@ class DynamicSelector:
             disable=not self.accelerator.is_main_process,
             dynamic_ncols=True
         ):
-            # with torch.no_grad():
-            #     loss = model(**batch).loss.detach().cpu()
-            # local_losses.append(loss)
-            first_key = next(iter(batch))
-            batch_size = batch[first_key].size(0)
-            fake_loss = torch.ones(batch_size, device=device)
-            local_losses.append(fake_loss)
+            with torch.no_grad():
+                loss = model(**batch).loss.detach().cpu()
+            local_losses.append(loss)
+            # first_key = next(iter(batch))
+            # batch_size = batch[first_key].size(0)
+            # fake_loss = torch.ones(batch_size, device=device)
+            # local_losses.append(fake_loss)
             
         local_losses = torch.cat(local_losses)
 
