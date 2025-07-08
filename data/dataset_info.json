@@ -2,6 +2,9 @@
   "identity": {
     "file_name": "identity.json"
   },
+  "sampled_medical_50000": {
+    "file_name": "medical/sampled_medical_50000.json"
+  },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
   },

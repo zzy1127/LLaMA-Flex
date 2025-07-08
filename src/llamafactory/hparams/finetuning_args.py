@@ -456,6 +456,18 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
+    enable_dynamic_train: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to enable dynamic train."},
+    )
+    warmup_step: int = field(
+        default=0,
+        metadata={"help": "Warm up steps for dynamic training"},
+    )
+    update_step: int = field(
+        default=0,
+        metadata={"help": "Update steps for dynamic training"},
+    )
 
     def __post_init__(self):
         def split_arg(arg):

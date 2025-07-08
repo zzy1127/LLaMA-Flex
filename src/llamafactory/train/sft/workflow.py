@@ -26,7 +26,7 @@ from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
-
+from .dynamic_trainer import DynamicTrainer
 
 if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
@@ -79,7 +79,7 @@ def run_sft(
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     # Initialize our Trainer
-    trainer = CustomSeq2SeqTrainer(
+    trainer = DynamicTrainer(
         model=model,
         args=training_args,
         finetuning_args=finetuning_args,
