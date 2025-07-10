@@ -142,7 +142,7 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.quantization_config import QuantizationMethod
 
-from .dynamic_selector import DynamicSelector
+from .selector.loss_selector import DynamicSelector
 
 TRAINING_ARGS_NAME = "training_args.bin"
 TRAINER_STATE_NAME = "trainer_state.json"
@@ -342,12 +342,9 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
         if self.finetuning_args.enable_dynamic_train:
             logger.info(f"[DynamicTrain] Dynamic training mode")
             total_warmup_samples = total_train_batch_size * self.finetuning_args.warmup_step
-            logger.info(f"[DynamicTrain] Warmup step {self.finetuning_args.warmup_step}, samples: {total_warmup_samples}")
-            splits = self.dynamic_selector.warmup(total_warmup_samples, replacement=True)
-            gpu_rank = self.accelerator.process_index
-            indices = splits[gpu_rank]
-            train_dataloader = self.get_train_dataloader(indices)
-            logger.info(f'[DynamicTrain] GPU: {gpu_rank}, 前五个indices: {indices[:5]}, 总长度: {len(indices)}')
+            logger.info(f"[DynamicTrain] Warmup step {self.finetuning_args.warmup_step}, warmup samples: {total_warmup_samples} in total")
+            warmup_indices = self.dynamic_selector.warmup(total_warmup_samples, replacement=True)
+            train_dataloader = self.get_train_dataloader(warmup_indices)
         else:
             train_dataloader = self.get_train_dataloader()
         if self.is_fsdp_xla_v2_enabled:
@@ -731,30 +728,27 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
                         # 动态训练更新
                         if (
                             self.finetuning_args.enable_dynamic_train and
-                            self.state.global_step * args.world_size == self.finetuning_args.warmup_step or
-                            (self.state.global_step * args.world_size > self.finetuning_args.warmup_step and
-                            self.state.global_step * args.world_size % self.finetuning_args.update_step == 0)
+                            self.state.global_step == self.finetuning_args.warmup_step or
+                            (self.state.global_step > self.finetuning_args.warmup_step and
+                            self.state.global_step % self.finetuning_args.update_step == 0)
                         ):
                             self.accelerator.wait_for_everyone()
                             torch.cuda.empty_cache()
                             torch.distributed.barrier()
 
-                            update_times = (self.state.global_step * args.world_size - self.finetuning_args.warmup_step) // self.finetuning_args.update_step + 1
+                            update_times = (self.state.global_step - self.finetuning_args.warmup_step) // self.finetuning_args.update_step + 1
                             logger.info(f"[DynamicTrain] Model training paused, starting the {update_times}th dynamic data selection...")
-                            split_indices = self.dynamic_selector.select(
+                            new_indices = self.dynamic_selector.select(
                                 model=model,
-                                step_id=self.state.global_step * args.world_size,
+                                step_id=self.state.global_step,
                                 num_samples=total_train_batch_size * self.finetuning_args.update_step
                             )
-                            # 广播切分结果：每个 rank 得到属于自己的部分
-                            gpu_rank = self.accelerator.process_index
-                            local_indices = split_indices[gpu_rank]
                             # 每个进程根据 local_indices 构造 dataloader
-                            train_loader = self.get_train_dataloader(indices=local_indices)
+                            train_loader = self.get_train_dataloader(indices=new_indices)
                             current_iterator = iter(train_loader)
 
                             if self.accelerator.is_main_process:
-                                print(f"[DynamicTrain] Updated dataloader at step {self.state.global_step}, {len(local_indices)} samples per GPU.")
+                                print(f"[DynamicTrain] Updated dataloader at step {self.state.global_step}, {len(new_indices)} samples in total.")
 
 
                     else:
