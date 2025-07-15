@@ -359,7 +359,12 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
             len_dataloader, # 等于数据集长度/worldsize/micro_batchsize
             max_steps,
         ) = self.set_initial_training_values(args, train_dataloader, total_train_batch_size)
+        if self.finetuning_args.enable_dynamic_train:
+            max_steps = (self.finetuning_args.warmup_step + self.finetuning_args.update_step * self.finetuning_args.update_times)
+            logger.info(f"[DynamicTrain]Set max train steps to {max_steps}")
         num_train_tokens = None
+
+        # 这里还要改
         if self.args.include_tokens_per_second:
             num_train_tokens = self.num_tokens(train_dataloader, None if epoch_based else max_steps)
             # If going by epochs, multiply tokens linearly
@@ -539,27 +544,23 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
 
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
-
-        # 开始主训练循环
-        for epoch in range(epochs_trained, num_train_epochs):
+        
+        if self.finetuning_args.enable_dynamic_train:
+            # 放弃epoch逻辑，相当于只训练一个epoch，通过step来训练
             current_dataloader = train_dataloader
             if self.finetuning_args.enable_dynamic_train and self.state.global_step < self.finetuning_args.warmup_step:
                 logger.info("[DynamicTrain] Model warmup in progress...")
-            if hasattr(current_dataloader, "set_epoch"):
-                current_dataloader.set_epoch(epoch)
+            # if hasattr(current_dataloader, "set_epoch"):
+            #     current_dataloader.set_epoch(epoch)
             
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None
 
-            steps_in_epoch = (
-                len(current_dataloader)
-                if len_dataloader is not None
-                else args.max_steps * args.gradient_accumulation_steps
-            )
+            steps_in_epoch = max_steps * args.gradient_accumulation_steps
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
-            if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
+            if resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
                 self._load_rng_state(resume_from_checkpoint)
 
             rng_to_sync = False
@@ -712,14 +713,14 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
                         model.zero_grad()
                         # 同步精度然后反向传播，此时每个gpu上处理了per_gpu_batch_size * acc个数据，global_step+1
                         self.state.global_step += 1
-                        self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        self.state.epoch = (step + 1 + steps_skipped) / steps_in_epoch
                         self.control = self.callback_handler.on_step_end(args, self.state, self.control)
                         self._maybe_log_save_evaluate(
                             tr_loss,
                             grad_norm,
                             model,
                             trial,
-                            epoch,
+                            0,
                             ignore_keys_for_eval,
                             start_time,
                             learning_rate=learning_rate,
@@ -727,7 +728,7 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
 
                         # 动态训练更新
                         if (
-                            self.finetuning_args.enable_dynamic_train and (
+                            self.state.global_step < max_steps and (
                             self.state.global_step == self.finetuning_args.warmup_step or
                             (self.state.global_step > self.finetuning_args.warmup_step and
                             self.state.global_step % self.finetuning_args.update_step == 0))
@@ -788,8 +789,231 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
                         "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
                         "configured. Check your training configuration if this is unexpected."
                     )
-            if self.control.should_training_stop:
-                break
+            # if self.control.should_training_stop:
+            #     break
+        else:
+            # 开始主训练循环
+            for epoch in range(epochs_trained, num_train_epochs):
+                current_dataloader = train_dataloader
+                if hasattr(current_dataloader, "set_epoch"):
+                    current_dataloader.set_epoch(epoch)
+                
+                # Reset the past mems state at the beginning of each epoch if necessary.
+                if args.past_index >= 0:
+                    self._past = None
+
+                steps_in_epoch = (
+                    len(current_dataloader)
+                    if len_dataloader is not None
+                    else args.max_steps * args.gradient_accumulation_steps
+                )
+                self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
+
+                if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
+                    self._load_rng_state(resume_from_checkpoint)
+
+                rng_to_sync = False
+                steps_skipped = 0
+                if steps_trained_in_current_epoch > 0:
+                    current_dataloader = skip_first_batches(current_dataloader, steps_trained_in_current_epoch)
+                    steps_skipped = steps_trained_in_current_epoch
+                    steps_trained_in_current_epoch = 0
+                    rng_to_sync = True
+
+                step = -1
+                current_iterator = iter(current_dataloader)
+                # We chunkify the epoch iterator into gradient accumulation steps `n` batches
+                remainder = num_examples % args.gradient_accumulation_steps
+                if remainder == 0:
+                    remainder = args.gradient_accumulation_steps
+                update_step = -1
+                # 一个epoch中的模型总更新次数
+                total_updates = steps_in_epoch // args.gradient_accumulation_steps + 1
+                if args.gradient_accumulation_steps == 1:
+                    total_updates -= 1
+                for _ in range(total_updates):
+                    update_step += 1
+                    # 当前应该拿到的batch数，一般情况是gradient_accumulation_steps，每这么多个batch反向传播一次梯度，每个batch有batch_size个样本
+                    num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
+
+                    batch_samples, num_items_in_batch = self.get_batch_samples(current_iterator, num_batches, args.device)
+                    # 遍历当前批次的样本
+                    for i, inputs in enumerate(batch_samples):
+                        step += 1  # 每次迭代时增加全局步数
+
+                        # 判断是否达到同步步数，或者是当前epoch的最后一个步数
+                        do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
+                        
+                        # 由于我们使用了预取（prefetching），我们需要手动设置同步梯度
+                        self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
+
+                        # 如果需要记录输入的token数量
+                        if self.args.include_num_input_tokens_seen:
+                            main_input_name = getattr(self.model, "main_input_name", "input_ids")  # 获取模型的主输入名称（默认为input_ids）
+                            
+                            # 检查模型的输入是否包含主输入名称
+                            if main_input_name not in inputs:
+                                logger.warning(
+                                    "Tried to track the number of tokens seen, however the current model is "
+                                    "not configured properly to know what item is the input. To fix this, add "
+                                    "a `main_input_name` attribute to the model class you are using."
+                                )
+                            else:
+                                # 计算当前输入的tokens数量，并将其加入到已看到的总token数中
+                                input_tokens = inputs[main_input_name].numel()  # 计算当前输入的tokens数量
+                                input_tokens = torch.tensor(input_tokens, device=self.args.device, dtype=torch.int64)  # 转换为张量
+                                self.state.num_input_tokens_seen += self.accelerator.gather(input_tokens).sum().item()  # 累加已看到的token数量
+
+                        # 如果需要同步随机数生成器（用于恢复训练）
+                        if rng_to_sync:
+                            self._load_rng_state(resume_from_checkpoint)  # 从检查点加载随机数生成器的状态
+                            rng_to_sync = False  # 重置同步标志
+
+                        # 如果恢复训练且当前epoch还有未训练的步数，跳过已训练的步骤
+                        if steps_trained_in_current_epoch > 0:
+                            steps_trained_in_current_epoch -= 1  # 减少剩余的训练步数
+                            if steps_trained_progress_bar is not None:
+                                steps_trained_progress_bar.update(1)  # 更新已训练步数的进度条
+                            if steps_trained_in_current_epoch == 0:
+                                self._load_rng_state(resume_from_checkpoint)  # 恢复检查点的随机数生成器状态
+                            continue  # 跳过这次迭代，进入下一次迭代
+                        elif steps_trained_progress_bar is not None:
+                            steps_trained_progress_bar.close()  # 关闭已训练步数的进度条
+                            steps_trained_progress_bar = None  # 重置进度条
+
+                        # 每当步数达到梯度累积步骤数时，执行一次同步操作
+                        if step % args.gradient_accumulation_steps == 0:
+                            self.control = self.callback_handler.on_step_begin(args, self.state, self.control)  # 执行步骤开始的回调
+
+                        # 在生成训练时避免依赖`accelerator.accumulate`，显式设置是否同步
+                        context = (
+                            functools.partial(self.accelerator.no_sync, model=model)  # 如果不是最后一个批次，则不进行同步
+                            if i != len(batch_samples) - 1
+                            and self.accelerator.distributed_type != DistributedType.DEEPSPEED
+                            else contextlib.nullcontext  # 否则不使用同步
+                        )
+                        
+                        with context():  # 在非同步上下文中进行训练
+                            tr_loss_step = self.training_step(model, inputs, num_items_in_batch)  # 执行一次训练步骤，返回该步的损失值
+
+                        # 检查损失是否为NaN或Infinity，如果是，使用之前的损失值替代
+                        if (
+                            args.logging_nan_inf_filter
+                            and not is_torch_xla_available()
+                            and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                        ):
+                            tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)  # 如果损失为NaN或Inf，则使用平均损失
+                        else:
+                            if tr_loss.device != tr_loss_step.device:
+                                raise ValueError(
+                                    f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
+                                )  # 检查计算的损失是否在原始设备上
+                            tr_loss = tr_loss + tr_loss_step  # 将当前步的损失加入总损失
+
+                        # 累加浮点数操作的数量
+                        self.current_flos += float(self.floating_point_ops(inputs))
+
+                        # step达到acc，同步梯度
+                        if do_sync_step:
+                            # Since we perform prefetching, we need to manually set sync_gradients to True
+                            self.accelerator.gradient_state._set_sync_gradients(True)
+
+                            # Gradient clipping
+                            if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                                if is_sagemaker_mp_enabled() and args.fp16:
+                                    _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
+                                elif self.use_apex:
+                                    # Revert to normal clipping otherwise, handling Apex or full precision
+                                    _grad_norm = nn.utils.clip_grad_norm_(
+                                        amp.master_params(self.optimizer),
+                                        args.max_grad_norm,
+                                    )
+                                else:
+                                    _grad_norm = self.accelerator.clip_grad_norm_(
+                                        model.parameters(),
+                                        args.max_grad_norm,
+                                    )
+
+                                if (
+                                    is_accelerate_available()
+                                    and self.accelerator.distributed_type == DistributedType.DEEPSPEED
+                                ):
+                                    grad_norm = model.get_global_grad_norm()
+                                    # In some cases the grad norm may not return a float
+                                    if hasattr(grad_norm, "item"):
+                                        grad_norm = grad_norm.item()
+                                else:
+                                    grad_norm = _grad_norm
+
+                            self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
+
+                            self.optimizer.step()
+
+                            self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
+
+                            # get leaning rate before update
+                            learning_rate = self._get_learning_rate()
+
+                            if not self.accelerator.optimizer_step_was_skipped:
+                                # Delay optimizer scheduling until metrics are generated
+                                if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                                    self.lr_scheduler.step()
+
+                            model.zero_grad()
+                            # 同步精度然后反向传播，此时每个gpu上处理了per_gpu_batch_size * acc个数据，global_step+1
+                            self.state.global_step += 1
+                            self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                            self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                            self._maybe_log_save_evaluate(
+                                tr_loss,
+                                grad_norm,
+                                model,
+                                trial,
+                                epoch,
+                                ignore_keys_for_eval,
+                                start_time,
+                                learning_rate=learning_rate,
+                            )
+
+                        else:
+                            self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+
+                        # PyTorch/XLA relies on the data loader to insert the mark_step for
+                        # each step. Since we are breaking the loop early, we need to manually
+                        # insert the mark_step here.
+                        if self.control.should_epoch_stop or self.control.should_training_stop:
+                            if is_torch_xla_available():
+                                xm.mark_step()
+                            break
+                    # We also need to break out of the nested loop
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        if is_torch_xla_available():
+                            xm.mark_step()
+                        break
+                if step < 0:
+                    logger.warning(
+                        "There seems not to be a single sample in your epoch_iterator, stopping training at step"
+                        f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
+                        f" num_steps ({max_steps}) higher than the number of available samples."
+                    )
+                    self.control.should_training_stop = True
+
+                self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+                self._maybe_log_save_evaluate(
+                    tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=learning_rate
+                )
+
+                if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
+                    if is_torch_xla_available():
+                        # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
+                        xm.master_print(met.metrics_report())
+                    else:
+                        logger.warning(
+                            "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
+                            "configured. Check your training configuration if this is unexpected."
+                        )
+                if self.control.should_training_stop:
+                    break
         # 结束主训练循环
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training

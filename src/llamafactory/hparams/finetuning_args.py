@@ -468,6 +468,10 @@ class FinetuningArguments(
         default=0,
         metadata={"help": "Update steps for dynamic training"},
     )
+    update_times: int = field(
+        default=1,
+        metadata={"help": "Total update times during the whole dynamic training progress"},
+    )
 
     def __post_init__(self):
         def split_arg(arg):
