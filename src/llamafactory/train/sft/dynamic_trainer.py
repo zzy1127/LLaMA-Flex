@@ -361,10 +361,12 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
         ) = self.set_initial_training_values(args, train_dataloader, total_train_batch_size)
         if self.finetuning_args.enable_dynamic_train:
             max_steps = (self.finetuning_args.warmup_step + self.finetuning_args.update_step * self.finetuning_args.update_times)
+            epoch_based = False
             logger.info(f"[DynamicTrain]Set max train steps to {max_steps}")
+            logger.info(f"[DynamicTrain]Set epoch_based = False")
         num_train_tokens = None
 
-        # 这里还要改
+        # 这里是每个gpu的tokens
         if self.args.include_tokens_per_second:
             num_train_tokens = self.num_tokens(train_dataloader, None if epoch_based else max_steps)
             # If going by epochs, multiply tokens linearly
