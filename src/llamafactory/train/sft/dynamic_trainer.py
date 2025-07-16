@@ -550,6 +550,7 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
         if self.finetuning_args.enable_dynamic_train:
             # 放弃epoch逻辑，相当于只训练一个epoch，通过step来训练
             current_dataloader = train_dataloader
+            epoch = 0
             if self.finetuning_args.enable_dynamic_train and self.state.global_step < self.finetuning_args.warmup_step:
                 logger.info("[DynamicTrain] Model warmup in progress...")
             # if hasattr(current_dataloader, "set_epoch"):
@@ -722,7 +723,7 @@ class DynamicTrainer(CustomSeq2SeqTrainer):
                             grad_norm,
                             model,
                             trial,
-                            0,
+                            epoch,
                             ignore_keys_for_eval,
                             start_time,
                             learning_rate=learning_rate,
